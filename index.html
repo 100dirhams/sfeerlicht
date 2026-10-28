@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sfeerlicht</title>
+  <style>
+    :root {
+      --bg: #15131a;
+      --card: #221f2a;
+      --text: #f2eef7;
+      --muted: #9a93a8;
+      --accent: #ffb347;
+      --ok: #6fd08c;
+      --err: #ff6b6b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 16px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    main { max-width: 480px; margin: 0 auto; display: grid; gap: 14px; }
+    h1 { font-size: 1.4rem; margin: 4px 0; }
+    .card { background: var(--card); border-radius: 14px; padding: 14px; }
+    .card h2 { font-size: .85rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+    button {
+      font: inherit; border: 0; border-radius: 10px; padding: 14px 10px;
+      background: #34303f; color: var(--text); cursor: pointer;
+    }
+    button:active { transform: scale(.97); }
+    button:disabled { opacity: .4; }
+    #connectBtn { width: 100%; background: var(--accent); color: #1b1720; font-weight: 600; }
+    .row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .scenes { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
+    .scenes button { display: flex; align-items: center; gap: 8px; justify-content: flex-start; }
+    .swatch { width: 14px; height: 14px; border-radius: 50%; flex: none; }
+    label { display: flex; justify-content: space-between; margin-bottom: 6px; }
+    input[type=range] { width: 100%; accent-color: var(--accent); }
+    input[type=color] { width: 100%; height: 48px; border: 0; background: none; padding: 0; }
+    #status { font-size: 1.05rem; font-weight: 600; min-height: 1.4em; }
+    #conn { font-size: .85rem; color: var(--muted); }
+    #conn.on { color: var(--ok); }
+    #log {
+      font-family: ui-monospace, Consolas, monospace; font-size: .78rem;
+      max-height: 200px; overflow-y: auto; white-space: pre-wrap; color: var(--muted);
+    }
+    #log .in { color: var(--ok); }
+    #log .out { color: var(--accent); }
+    #log .err { color: var(--err); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Sfeerlicht woonkamer</h1>
+
+  <div class="card">
+    <button id="connectBtn">Verbinden via Bluetooth</button>
+    <p id="conn">Niet verbonden</p>
+    <div id="status">–</div>
+  </div>
+
+  <div class="card">
+    <h2>Stand</h2>
+    <div class="row">
+      <button data-cmd="ON">Aan</button>
+      <button data-cmd="DIM">Dim</button>
+      <button data-cmd="OFF">Uit</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Scènes</h2>
+    <div class="scenes" id="scenes"></div>
+  </div>
+
+  <div class="card">
+    <h2>Kleur en helderheid</h2>
+    <label for="brightness"><span>Helderheid</span><span id="brightnessValue">100%</span></label>
+    <input id="brightness" type="range" min="1" max="100" value="100">
+    <p></p>
+    <input id="color" type="color" value="#ff8c28" aria-label="Eigen kleur">
+  </div>
+
+  <div class="card">
+    <h2>Automatisch dimmen</h2>
+    <label for="timeout"><span>Dimmen na</span><span id="timeoutValue">30 s</span></label>
+    <input id="timeout" type="range" min="5" max="300" step="5" value="30">
+  </div>
+
+  <div class="card">
+    <h2>BLE-log</h2>
+    <div id="log"></div>
+  </div>
+</main>
+
+<script>
+  // Nordic UART Service: zelfde UUID's als in config.h op de ESP32.
+  const NUS_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+  const NUS_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // gsm -> ESP32 (write)
+  const NUS_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // ESP32 -> gsm (notify)
+
+  // Moet overeenkomen met LIGHT_SCENES in config.h (index = positie).
+  const SCENES = [
+    ["Warm wit", "#ff8c28"], ["Koel wit", "#ffffff"], ["Zonsondergang", "#ff3c00"],
+    ["Rood", "#ff0000"], ["Groen", "#00ff00"], ["Blauw", "#0000ff"], ["Paars", "#a000ff"],
+  ];
+
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  let device = null;
+  let rxCharacteristic = null;
+  let receiveBuffer = "";
+
+  const $ = (id) => document.getElementById(id);
+
+  function log(text, cls) {
+    const line = document.createElement("div");
+    line.className = cls || "";
+    line.textContent = `${new Date().toLocaleTimeString()}  ${text}`;
+    $("log").prepend(line);
+  }
+
+  function setControlsEnabled(enabled) {
+    document.querySelectorAll("button:not(#connectBtn), input").forEach((el) => (el.disabled = !enabled));
+  }
+
+  // --- Verbinden ----------------------------------------------------------
+  // 1. Gebruiker kiest het apparaat (browser filtert op de NUS-service).
+  // 2. GATT-verbinding opzetten en de service + characteristics ophalen.
+  // 3. Notificaties op TX inschakelen (schrijft de CCCD/2902-descriptor).
+  async function connect() {
+    try {
+      device = await navigator.bluetooth.requestDevice({ filters: [{ services: [NUS_SERVICE] }] });
+      device.addEventListener("gattserverdisconnected", onDisconnected);
+
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(NUS_SERVICE);
+      rxCharacteristic = await service.getCharacteristic(NUS_RX);
+      const txCharacteristic = await service.getCharacteristic(NUS_TX);
+
+      await txCharacteristic.startNotifications();
+      txCharacteristic.addEventListener("characteristicvaluechanged", onNotification);
+
+      $("conn").textContent = `Verbonden met ${device.name}`;
+      $("conn").className = "on";
+      $("connectBtn").textContent = "Verbinding verbreken";
+      setControlsEnabled(true);
+      log(`Verbonden met ${device.name}`);
+
+      send("?"); // huidige status opvragen
+    } catch (error) {
+      log(`Fout: ${error.message}`, "err");
+    }
+  }
+
+  function onDisconnected() {
+    rxCharacteristic = null;
+    $("conn").textContent = "Niet verbonden";
+    $("conn").className = "";
+    $("connectBtn").textContent = "Verbinden via Bluetooth";
+    setControlsEnabled(false);
+    log("Verbinding verbroken", "err");
+  }
+
+  // --- Ontvangen (ESP32 -> gsm) ------------------------------------------
+  // De ESP32 knipt lange berichten op; we bufferen tot een '\n' binnenkomt.
+  function onNotification(event) {
+    receiveBuffer += decoder.decode(event.target.value);
+    let newline;
+    while ((newline = receiveBuffer.indexOf("\n")) >= 0) {
+      const message = receiveBuffer.slice(0, newline).trim();
+      receiveBuffer = receiveBuffer.slice(newline + 1);
+      if (message) handleStatus(message);
+    }
+  }
+
+  function handleStatus(message) {
+    log(`← ${message}`, "in");
+    if (/AAN|Gedimde|UIT/.test(message)) $("status").textContent = message;
+  }
+
+  // --- Versturen (gsm -> ESP32) ------------------------------------------
+  async function send(command) {
+    if (!rxCharacteristic) return;
+    try {
+      await rxCharacteristic.writeValue(encoder.encode(command));
+      log(`→ ${command}`, "out");
+    } catch (error) {
+      log(`Versturen mislukt: ${error.message}`, "err");
+    }
+  }
+
+  // --- Bediening koppelen -------------------------------------------------
+  $("connectBtn").addEventListener("click", () => {
+    if (device && device.gatt.connected) device.gatt.disconnect();
+    else connect();
+  });
+
+  document.querySelectorAll("[data-cmd]").forEach((btn) =>
+    btn.addEventListener("click", () => send(btn.dataset.cmd)));
+
+  SCENES.forEach(([name, color], index) => {
+    const btn = document.createElement("button");
+    btn.innerHTML = `<span class="swatch" style="background:${color}"></span>${name}`;
+    btn.addEventListener("click", () => send(`S:${index}`));
+    $("scenes").append(btn);
+  });
+
+  // 'input' werkt het label live bij, 'change' verstuurt pas bij loslaten
+  // zodat we de BLE-verbinding niet overspoelen met berichten.
+  $("brightness").addEventListener("input", (e) => ($("brightnessValue").textContent = `${e.target.value}%`));
+  $("brightness").addEventListener("change", (e) => send(`B:${e.target.value}`));
+
+  $("color").addEventListener("change", (e) => send(`C:${e.target.value.slice(1)}`));
+
+  $("timeout").addEventListener("input", (e) => ($("timeoutValue").textContent = `${e.target.value} s`));
+  $("timeout").addEventListener("change", (e) => send(`T:${e.target.value}`));
+
+  setControlsEnabled(false);
+  if (!navigator.bluetooth) {
+    $("connectBtn").disabled = true;
+    log("Web Bluetooth niet beschikbaar. Gebruik Chrome op Android (of Bluefy op iOS).", "err");
+  }
+</script>
+</body>
+</html>
