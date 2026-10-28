@@ -79,7 +79,7 @@
   <div class="card">
     <h2>Kleur en helderheid</h2>
     <label for="brightness"><span>Helderheid</span><span id="brightnessValue">100%</span></label>
-    <input id="brightness" type="range" min="1" max="100" value="100">
+    <input id="brightness" type="range" min="0" max="100" value="100">
     <p></p>
     <input id="color" type="color" value="#ff8c28" aria-label="Eigen kleur">
   </div>
@@ -179,7 +179,15 @@
 
   function handleStatus(message) {
     log(`← ${message}`, "in");
-    if (/AAN|Gedimde|UIT/.test(message)) $("status").textContent = message;
+    if (!/AAN|Gedimde|UIT/.test(message)) return;
+    $("status").textContent = message;
+
+    // Slider gelijkzetten met de echte helderheid uit de status,
+    // bv. "Gedimde modus actief | Warm wit | 10%" -> 10. UIT = 0.
+    const match = message.match(/(\d+)%/);
+    const percent = match ? match[1] : 0;
+    $("brightness").value = percent;
+    $("brightnessValue").textContent = `${percent}%`;
   }
 
   // --- Versturen (gsm -> ESP32) ------------------------------------------
